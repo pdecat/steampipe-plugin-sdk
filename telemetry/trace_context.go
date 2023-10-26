@@ -3,6 +3,7 @@ package telemetry
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/trace"
@@ -21,5 +22,5 @@ func GetTracer(service string) trace.Tracer {
 
 func StartSpan(baseCtx context.Context, service string, format string, args ...interface{}) (context.Context, trace.Span) {
 	tr := GetTracer(service)
-	return tr.Start(baseCtx, fmt.Sprintf(format, args...))
+	return tr.Start(baseCtx, fmt.Sprintf(format, args...), trace.WithTimestamp(time.Now()))
 }
