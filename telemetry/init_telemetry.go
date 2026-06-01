@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,6 +33,10 @@ func Init(serviceName string) (func(), error) {
 	metricsEnabled := slices.Contains([]string{OtelAll, OtelMetrics}, telemetryEnvStr)
 
 	log.Printf("[TRACE] telemetry.Init service '%s', tracingEnabled: %v, metricsEnabled: %v", serviceName, tracingEnabled, metricsEnabled)
+
+	if tracingEnabled {
+		log.Printf("[INFO] telemetry trace sampling: sampler=%s, per-row span sample ratio=%.4g", resolveSampler().Description(), RowSpanSampleRatio())
+	}
 
 	if !tracingEnabled && !metricsEnabled {
 		log.Printf("[TRACE] metrics and tracing disabled' - returning")
@@ -176,7 +181,7 @@ func initTracing(ctx context.Context, grpcConn *grpc.ClientConn, serviceName str
 
 	bsp := sdktrace.NewBatchSpanProcessor(traceExp)
 	tracerProvider := sdktrace.NewTracerProvider(
-		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+		sdktrace.WithSampler(resolveSampler()),
 		sdktrace.WithResource(res),
 		sdktrace.WithSpanProcessor(bsp),
 	)
@@ -201,4 +206,28 @@ func getResource(ctx context.Context, serviceName string) (*resource.Resource, e
 			semconv.ServiceNameKey.String(serviceName),
 		),
 	)
+}
+
+// resolveSampler builds the trace sampler from STEAMPIPE_OTEL_TRACE_SAMPLE_RATIO.
+// Unset or >=1 -> AlwaysSample (historical behaviour); <=0 -> NeverSample; a
+// fractional value -> ParentBased(TraceIdRatioBased(ratio)) so root spans use the
+// trace-id ratio and child spans honour the (possibly cross-process) parent decision.
+func resolveSampler() sdktrace.Sampler {
+	raw, ok := os.LookupEnv(EnvOtelTraceSampleRatio)
+	if !ok {
+		return sdktrace.AlwaysSample()
+	}
+	ratio, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+	if err != nil {
+		log.Printf("[WARN] invalid %s=%q (expected float in [0,1]); using AlwaysSample", EnvOtelTraceSampleRatio, raw)
+		return sdktrace.AlwaysSample()
+	}
+	switch {
+	case ratio >= 1:
+		return sdktrace.AlwaysSample()
+	case ratio <= 0:
+		return sdktrace.NeverSample()
+	default:
+		return sdktrace.ParentBased(sdktrace.TraceIDRatioBased(ratio))
+	}
 }

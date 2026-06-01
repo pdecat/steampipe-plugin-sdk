@@ -113,7 +113,7 @@ func WrapHydrate(hydrate namedHydrateFunc, ignoreConfig *IgnoreConfig) namedHydr
 	res := hydrate.clone()
 
 	res.Func = func(ctx context.Context, d *QueryData, h *HydrateData) (item interface{}, err error) {
-		ctx, span := telemetry.StartSpan(ctx, d.Table.Plugin.Name, "hydrateWithIgnoreError (%s)", d.Table.Name)
+		ctx, span := telemetry.StartRowSpan(ctx, d.Table.Plugin.Name, "hydrateWithIgnoreError (%s)", d.Table.Name)
 		span.SetAttributes(
 			attribute.String("hydrate-func", hydrate.Name),
 		)
