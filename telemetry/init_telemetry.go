@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
@@ -23,9 +24,17 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-func Init(serviceName string) (func(), error) {
+func Init(serviceName string, serviceVersion ...string) (func(), error) {
 
 	ctx := context.Background()
+
+	// optional service version (variadic to stay backward-compatible with callers
+	// that only pass a name); threaded into the OTel resource so spans/metrics can
+	// carry service.version
+	version := ""
+	if len(serviceVersion) > 0 {
+		version = serviceVersion[0]
+	}
 
 	// is telemetry enabled
 	telemetryEnvStr := strings.ToLower(os.Getenv(EnvOtelLevel))
@@ -71,14 +80,14 @@ func Init(serviceName string) (func(), error) {
 	var meterProvider *sdkmetric.MeterProvider
 
 	if tracingEnabled {
-		traceExp, tracerProvider, err = initTracing(ctx, grpcConn, serviceName)
+		traceExp, tracerProvider, err = initTracing(ctx, grpcConn, serviceName, version)
 		if err != nil {
 			return nil, err
 		}
 	}
 
 	if metricsEnabled {
-		metricReader, meterProvider, err = initMetrics(ctx, grpcConn, serviceName)
+		metricReader, meterProvider, err = initMetrics(ctx, grpcConn, serviceName, version)
 		if err != nil {
 			return nil, err
 		}
@@ -136,9 +145,9 @@ func Init(serviceName string) (func(), error) {
 }
 
 // initMetrics initializes OpenTelemetry metrics SDK and exporters which push data over the given GRPC connection
-func initMetrics(ctx context.Context, grpcConnection *grpc.ClientConn, serviceName string) (sdkmetric.Reader, *sdkmetric.MeterProvider, error) {
+func initMetrics(ctx context.Context, grpcConnection *grpc.ClientConn, serviceName, serviceVersion string) (sdkmetric.Reader, *sdkmetric.MeterProvider, error) {
 	log.Printf("[TRACE] telemetry.initMetrics")
-	res, err := getResource(ctx, serviceName)
+	res, err := getResource(ctx, serviceName, serviceVersion)
 	if err != nil {
 		log.Printf("[TRACE] initTracing: failed to create resource: %s", err.Error())
 		return nil, nil, fmt.Errorf("failed to initialise Open Telemetry: %s", err.Error())
@@ -165,8 +174,8 @@ func initMetrics(ctx context.Context, grpcConnection *grpc.ClientConn, serviceNa
 }
 
 // initTracing initializes the OpenTelemetry tracing/span SDK and exporters which push data over the given GRPC connection
-func initTracing(ctx context.Context, grpcConn *grpc.ClientConn, serviceName string) (*otlptrace.Exporter, *sdktrace.TracerProvider, error) {
-	res, err := getResource(ctx, serviceName)
+func initTracing(ctx context.Context, grpcConn *grpc.ClientConn, serviceName, serviceVersion string) (*otlptrace.Exporter, *sdktrace.TracerProvider, error) {
+	res, err := getResource(ctx, serviceName, serviceVersion)
 	if err != nil {
 		log.Printf("[TRACE] initTracing: failed to create resource: %s", err.Error())
 		return nil, nil, fmt.Errorf("failed to initialise Open Telemetry: %s", err.Error())
@@ -195,16 +204,22 @@ func initTracing(ctx context.Context, grpcConn *grpc.ClientConn, serviceName str
 }
 
 // getResource creates a resource that we can set to the TracerProvider and MeterProvider
-func getResource(ctx context.Context, serviceName string) (*resource.Resource, error) {
+func getResource(ctx context.Context, serviceName, serviceVersion string) (*resource.Resource, error) {
+	attributes := []attribute.KeyValue{
+		// the service name used to display traces in backends
+		semconv.ServiceNameKey.String(serviceName),
+	}
+	// the service version, when the caller provides one (e.g. a standalone FDW
+	// compiled for a specific plugin build), so backends can attribute spans to it
+	if serviceVersion != "" {
+		attributes = append(attributes, semconv.ServiceVersionKey.String(serviceVersion))
+	}
 	return resource.New(ctx,
 		resource.WithFromEnv(),
 		resource.WithProcess(),
 		resource.WithTelemetrySDK(),
 		resource.WithHost(),
-		resource.WithAttributes(
-			// the service name used to display traces in backends
-			semconv.ServiceNameKey.String(serviceName),
-		),
+		resource.WithAttributes(attributes...),
 	)
 }
 
