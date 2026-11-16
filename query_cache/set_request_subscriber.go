@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/sethvargo/go-retry"
+	"github.com/turbot/go-kit/helpers"
 	sdkproto "github.com/turbot/steampipe-plugin-sdk/v6/grpc/proto"
 	"log"
 	"time"
@@ -53,14 +54,24 @@ func (s *setRequestSubscriber) readRowsAsync(ctx context.Context) {
 			log.Printf("[INFO] setRequestSubscriber readRowsAsync goroutine returning - doneChan CLOSED - publisher %s (%s)", s.publisher.CallId, s.callId)
 		}()
 
+		// the internal goroutine stops when the execute request is cancelled, not only when ctx is done
+		readCtx, cancelRead := context.WithCancel(ctx)
+		defer cancelRead()
+		stopCancelOnStreamDone := context.AfterFunc(s.streamContext, cancelRead)
+		defer stopCancelOnStreamDone()
+
 		// internal goroutine to read all rows from the publisher and stream them
-		streamDone := s.readAndStreamAsync(ctx)
+		streamDone := s.readAndStreamAsync(readCtx)
 
 		// wait for all rows to be streams (or cancellation)
 		select {
 		// first check for context cancellation - this may happen if channel is blocked and scane is subsequently cancelled
 		case <-s.streamContext.Done():
 			log.Printf("[INFO] readRowsAsync stream context was cancelled - publisher %s (%s)", s.publisher.CallId, s.callId)
+			// wait for the internal goroutine to stop before doneChan is closed: the execute request
+			// closes its output channel once its readers are done, so a row streamed after that is a
+			// send on a closed channel, which panics and takes the whole plugin process down
+			<-streamDone
 		// all rows are streamed, or there was an error
 		case err = <-streamDone:
 			log.Printf("[INFO] readRowsAsync finished streaming - publisher %s (%s)", s.publisher.CallId, s.callId)
@@ -74,6 +85,16 @@ func (s *setRequestSubscriber) readAndStreamAsync(ctx context.Context) chan erro
 	var streamDone = make(chan error, 1)
 
 	go func() {
+		// a panic here (such as a send on a closed channel) would abort the whole plugin process:
+		// turn it into an error for this reader instead. Nothing was sent to streamDone yet,
+		// since every send is followed by a return
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[WARN] readAndStreamAsync recovered panic %v (%s)", r, s.callId)
+				streamDone <- helpers.ToError(r)
+			}
+		}()
+
 		baseRetryInterval := 1 * time.Millisecond
 		maxRetryInterval := 50 * time.Millisecond
 		backoff := retry.WithCappedDuration(maxRetryInterval, retry.NewExponential(baseRetryInterval))
@@ -111,15 +132,21 @@ func (s *setRequestSubscriber) readAndStreamAsync(ctx context.Context) chan erro
 			}
 
 			for _, row := range rowsTostream {
+				// check for context cancellation BEFORE streaming the row: once the execute request
+				// is cancelled, nothing may be sent to it any more
+				if err := s.streamContext.Err(); err != nil {
+					log.Printf("[INFO] readAndStreamAsync stream context cancelled (%s)", s.callId)
+					streamDone <- err
+					return
+				}
+				if err := ctx.Err(); err != nil {
+					log.Printf("[INFO] readAndStreamAsync context cancelled (%s)", s.callId)
+					streamDone <- err
+					return
+				}
 				log.Printf("[TRACE] readAndStreamAsync stream row (%s)", s.callId)
 				s.streamRowFunc(row)
 				s.rowsStreamed++
-				// check for contect cancellation
-				if s.streamContext.Err() != nil {
-					log.Printf("[INFO] readAndStreamAsync stream context cancelled (%s)", s.callId)
-					streamDone <- s.streamContext.Err()
-					return
-				}
 			}
 
 			log.Printf("[TRACE] readAndStreamAsync streaming complete (rows streamed %d) (%s)", s.rowsStreamed, s.callId)
